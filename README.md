@@ -59,8 +59,10 @@ The following arguments are supported:
 - `--require-device` to enforce that a Litra device must be connected. By default, the listener will keep running even if no Litra device is found. With this set, the listener will exit whenever it looks for a Litra device and none is found.
 - `--video-device` (Linux only) to watch a specific video device (e.g. `/dev/video0`). By default, all video devices will be watched.
 - `--delay` to customize the delay (in milliseconds) between a webcam event being detected and toggling your Litra. When your webcam turns on or off, multiple events may be generated in quick succession. Setting a delay allows the program to wait for all events before taking action, avoiding flickering. Defaults to 1.5 seconds (1500 milliseconds).
+- `--delay` to customize the delay (in milliseconds) between a webcam event being detected and toggling your Litra. When your webcam turns on or off, multiple events may be generated in quick succession. Setting a delay allows the program to wait for all events before taking action, avoiding flickering. Defaults to 1.5 seconds (1500 milliseconds).
 - `--verbose` to enable verbose logging
 - `--back` to toggle the back light on Litra Beam LX devices. When enabled, the back light will be turned on/off together with the front light.
+- `--save-state` to read the current Litra device settings to a state file and exit. Typically used by a systemd hook before reboot to persist settings. When starting `litra-autotoggle` it will look for this state file, restore the settings, and then delete the file.
 
 > [!NOTE]
 > Only one filter (`--serial-number`, `--device-path`, or `--device-type`) can be specified at a time.
@@ -141,6 +143,30 @@ Next, reboot your computer or run the following commands as `root`:
 
     # udevadm control --reload-rules
     # udevadm trigger
+
+## Setting up state persistence on reboot (Linux / systemd)
+
+If you're running `litra-autotoggle` via a `systemd` user service and want it to remember the light's settings (brightness, color, etc.) across reboots, you can configure it to save state before the system restarts. 
+
+First, ensure your main long-running `litra-autotoggle.service` knows how to launch the app. Then, use the provided `litra-autotoggle-reboot-save.service` file to save the state on reboot.
+
+To install and enable this supplementary service, open a terminal and run the following commands:
+
+```bash
+# Copy the service file to the systemd directory
+sudo cp litra-autotoggle-reboot-save.service /etc/systemd/system/
+
+# Reload systemd to pick up the new service
+sudo systemctl daemon-reload
+
+# Enable the service to run on reboot
+sudo systemctl enable litra-autotoggle-reboot-save.service
+```
+
+> [!NOTE]
+> Inside the `litra-autotoggle-reboot-save.service` file, the `ExecStart` path is set to `/usr/local/bin/litra-autotoggle`. If you installed `litra-autotoggle` somewhere else (like `~/.cargo/bin/litra-autotoggle`), make sure to update the path inside `/etc/systemd/system/litra-autotoggle-reboot-save.service`.
+
+Because `WantedBy=reboot.target` is used (and `Before=reboot.target`), systemd will execute `litra-autotoggle --save-state` only during a reboot, ignoring standard host power-offs. The state is saved to the standard user configuration directory (e.g. `~/.config/litra-autotoggle/state.yml`) and automatically loaded (and deleted) the next time the main `litra-autotoggle` service starts up.
 
 ## Windows-specific notes
 

@@ -1,4 +1,5 @@
 use clap::Parser;
+use directories::ProjectDirs;
 #[cfg(target_os = "linux")]
 use inotify::{EventMask, Inotify, WatchMask};
 use litra::{Device, DeviceError, DeviceHandle, Litra};
@@ -52,6 +53,20 @@ struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     back: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_state: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DeviceState {
+    serial_number: String,
+    device_type: String,
+    is_on: bool,
+    brightness_in_lumen: u16,
+    temperature_in_kelvin: u16,
+    is_back_on: Option<bool>,
+    back_brightness_percentage: Option<u8>,
 }
 
 /// Automatically turn your Logitech Litra device on when your webcam turns on, and off when your webcam turns off.
@@ -120,6 +135,13 @@ struct Cli {
         help = "Toggle the back light on Litra Beam LX devices. When enabled, the back light will be turned on/off together with the front light."
     )]
     back: bool,
+
+    #[clap(
+        long,
+        action,
+        help = "Instead of listening for webcam events to turn the device on/off, read the current Litra device settings to a state file and exit. Typically used by a systemd hook before reboot."
+    )]
+    save_state: bool,
 }
 
 fn check_device_filters<'a>(
@@ -287,6 +309,9 @@ fn merge_config_with_cli(mut cli: Cli) -> Result<Cli, CliError> {
         }
         if !cli.back {
             cli.back = config.back.unwrap_or(false);
+        }
+        if !cli.save_state {
+            cli.save_state = config.save_state.unwrap_or(false);
         }
     }
 
@@ -464,6 +489,205 @@ fn turn_off_all_supported_devices_and_log(
     Ok(())
 }
 
+fn get_state_file_path() -> Result<PathBuf, CliError> {
+    if let Some(proj_dirs) = ProjectDirs::from("", "", "litra-autotoggle") {
+        let config_dir = proj_dirs.config_dir();
+        if !config_dir.exists() {
+            if let Err(e) = fs::create_dir_all(config_dir) {
+                return Err(CliError::IoError(e));
+            }
+        }
+        Ok(config_dir.join("state.yml"))
+    } else {
+        Err(CliError::IoError(std::io::Error::other(
+            "Could not determine user config directory",
+        )))
+    }
+}
+
+fn save_device_states(
+    context: &mut Litra,
+    serial_number: Option<&str>,
+    device_path: Option<&str>,
+    device_type: Option<&str>,
+    require_device: bool,
+) -> Result<(), CliError> {
+    let device_handles = get_all_supported_devices(
+        context,
+        serial_number,
+        device_path,
+        device_type,
+        require_device,
+    )?;
+
+    if device_handles.is_empty() {
+        print_device_not_found_log(serial_number);
+        return Ok(());
+    }
+
+    let mut states = Vec::new();
+
+    for device_handle in device_handles {
+        let sn = get_serial_number_with_fallback(&device_handle);
+        info!(
+            "Reading state for {} device (serial number: {})",
+            device_handle.device_type(),
+            sn
+        );
+
+        let dt = match device_handle.device_type() {
+            litra::DeviceType::LitraGlow => "glow",
+            litra::DeviceType::LitraBeam => "beam",
+            litra::DeviceType::LitraBeamLX => "beam_lx",
+        };
+
+        let is_on = device_handle.is_on().unwrap_or(false);
+        let brightness_in_lumen = device_handle.brightness_in_lumen().unwrap_or(0);
+        let temperature_in_kelvin = device_handle.temperature_in_kelvin().unwrap_or(0);
+
+        let mut is_back_on = None;
+        let mut back_brightness_percentage = None;
+
+        if dt == "beam_lx" {
+            is_back_on = device_handle.is_back_on().ok();
+            back_brightness_percentage = device_handle.back_brightness_percentage().ok();
+        }
+
+        states.push(DeviceState {
+            serial_number: sn,
+            device_type: dt.to_string(),
+            is_on,
+            brightness_in_lumen,
+            temperature_in_kelvin,
+            is_back_on,
+            back_brightness_percentage,
+        });
+    }
+
+    let state_file_path = get_state_file_path()?;
+    let yaml = serde_yaml::to_string(&states).map_err(|e| {
+        CliError::IoError(std::io::Error::other(format!(
+            "Failed to serialize state: {}",
+            e
+        )))
+    })?;
+
+    fs::write(&state_file_path, yaml)?;
+    info!("Saved device state to {}", state_file_path.display());
+
+    Ok(())
+}
+
+fn restore_device_states(
+    context: &mut Litra,
+    serial_number: Option<&str>,
+    device_path: Option<&str>,
+    device_type: Option<&str>,
+    require_device: bool,
+) -> Result<(), CliError> {
+    let state_file_path = match get_state_file_path() {
+        Ok(path) => path,
+        Err(_) => return Ok(()),
+    };
+
+    if !state_file_path.exists() {
+        return Ok(());
+    }
+
+    info!(
+        "Found state file at {}. Restoring settings...",
+        state_file_path.display()
+    );
+
+    let contents = match fs::read_to_string(&state_file_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to read state file: {}", e);
+            return Ok(());
+        }
+    };
+
+    let states: Vec<DeviceState> = match serde_yaml::from_str(&contents) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse state file: {}", e);
+            return Ok(());
+        }
+    };
+
+    let device_handles = get_all_supported_devices(
+        context,
+        serial_number,
+        device_path,
+        device_type,
+        require_device,
+    )?;
+
+    if device_handles.is_empty() {
+        print_device_not_found_log(serial_number);
+    } else {
+        for device_handle in device_handles {
+            let sn = get_serial_number_with_fallback(&device_handle);
+            if let Some(state) = states.iter().find(|s| s.serial_number == sn) {
+                info!(
+                    "Restoring state for {} device (serial number: {})",
+                    state.device_type, sn
+                );
+
+                if let Err(e) = device_handle.set_brightness_in_lumen(state.brightness_in_lumen) {
+                    warn!(
+                        "Failed to set brightness for device (serial number: {}): {}",
+                        sn, e
+                    );
+                }
+                if let Err(e) = device_handle.set_temperature_in_kelvin(state.temperature_in_kelvin)
+                {
+                    warn!(
+                        "Failed to set temperature for device (serial number: {}): {}",
+                        sn, e
+                    );
+                }
+                if let Err(e) = device_handle.set_on(state.is_on) {
+                    warn!(
+                        "Failed to set power state for device (serial number: {}): {}",
+                        sn, e
+                    );
+                }
+
+                if state.device_type == "beam_lx" {
+                    if let Some(back_brightness) = state.back_brightness_percentage {
+                        if let Err(e) =
+                            device_handle.set_back_brightness_percentage(back_brightness)
+                        {
+                            warn!(
+                                "Failed to set back brightness for device (serial number: {}): {}",
+                                sn, e
+                            );
+                        }
+                    }
+                    if let Some(back_on) = state.is_back_on {
+                        if let Err(e) = device_handle.set_back_on(back_on) {
+                            warn!(
+                                "Failed to set back power state for device (serial number: {}): {}",
+                                sn, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete the state file after attempting restore so it only affects one restart
+    if let Err(e) = fs::remove_file(&state_file_path) {
+        warn!("Failed to remove state file after restoring: {}", e);
+    } else {
+        info!("State file removed successfully.");
+    }
+
+    Ok(())
+}
+
 fn print_device_not_found_log(serial_number: Option<&str>) {
     if serial_number.is_some() {
         warn!(
@@ -490,13 +714,34 @@ async fn handle_autotoggle_command(
     require_device: bool,
     delay: u64,
     back: bool,
+    save_state: bool,
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
 
+    if save_state {
+        let mut context_lock = context.lock().await;
+        return save_device_states(
+            &mut context_lock,
+            serial_number,
+            device_path,
+            device_type,
+            require_device,
+        );
+    }
+
     // Use context inside an async block with locking
     {
         let mut context_lock = context.lock().await;
+
+        let _ = restore_device_states(
+            &mut context_lock,
+            serial_number,
+            device_path,
+            device_type,
+            require_device,
+        );
+
         let device_handles = get_all_supported_devices(
             &mut context_lock,
             serial_number,
@@ -626,13 +871,34 @@ async fn handle_autotoggle_command(
     video_device: Option<&str>,
     delay: u64,
     back: bool,
+    save_state: bool,
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
 
+    if save_state {
+        let mut context_lock = context.lock().await;
+        return save_device_states(
+            &mut context_lock,
+            serial_number,
+            device_path,
+            device_type,
+            require_device,
+        );
+    }
+
     // Use context inside an async block with locking
     {
         let mut context_lock = context.lock().await;
+
+        let _ = restore_device_states(
+            &mut context_lock,
+            serial_number,
+            device_path,
+            device_type,
+            require_device,
+        );
+
         let device_handles = get_all_supported_devices(
             &mut context_lock,
             serial_number,
@@ -783,13 +1049,34 @@ async fn handle_autotoggle_command(
     require_device: bool,
     delay: u64,
     back: bool,
+    save_state: bool,
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
 
+    if save_state {
+        let mut context_lock = context.lock().await;
+        return save_device_states(
+            &mut context_lock,
+            serial_number,
+            device_path,
+            device_type,
+            require_device,
+        );
+    }
+
     // Use context inside an async block with locking
     {
         let mut context_lock = context.lock().await;
+
+        let _ = restore_device_states(
+            &mut context_lock,
+            serial_number,
+            device_path,
+            device_type,
+            require_device,
+        );
+
         let device_handles = get_all_supported_devices(
             &mut context_lock,
             serial_number,
@@ -985,6 +1272,7 @@ async fn main() -> ExitCode {
         args.require_device,
         args.delay,
         args.back,
+        args.save_state,
     )
     .await;
 
@@ -1021,6 +1309,7 @@ async fn main() -> ExitCode {
         args.video_device.as_deref(),
         args.delay,
         args.back,
+        args.save_state,
     )
     .await;
 
@@ -1056,6 +1345,7 @@ async fn main() -> ExitCode {
         args.require_device,
         args.delay,
         args.back,
+        args.save_state,
     )
     .await;
 

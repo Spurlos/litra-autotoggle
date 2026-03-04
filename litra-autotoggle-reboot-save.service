@@ -1,0 +1,13 @@
+[Unit]
+Description=Save Litra device state on reboot
+DefaultDependencies=no
+Before=reboot.target
+After=network.target
+
+[Service]
+Type=oneshot
+# Note: update this path if your litra-autotoggle binary is located elsewhere
+ExecStart=/usr/local/bin/litra-autotoggle --save-state
+
+[Install]
+WantedBy=reboot.target
