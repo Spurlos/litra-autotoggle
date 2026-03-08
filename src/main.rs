@@ -58,7 +58,7 @@ struct Config {
     save_state: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct DeviceState {
     serial_number: String,
     device_type: String,
@@ -403,6 +403,37 @@ fn toggle_back_light_if_applicable(device_handle: &DeviceHandle, on: bool, back:
     }
 }
 
+fn get_current_device_state(device_handle: &DeviceHandle) -> DeviceState {
+    let sn = get_serial_number_with_fallback(device_handle);
+    let dt = match device_handle.device_type() {
+        litra::DeviceType::LitraGlow => "glow",
+        litra::DeviceType::LitraBeam => "beam",
+        litra::DeviceType::LitraBeamLX => "beam_lx",
+    };
+
+    let is_on = device_handle.is_on().unwrap_or(false);
+    let brightness_in_lumen = device_handle.brightness_in_lumen().unwrap_or(0);
+    let temperature_in_kelvin = device_handle.temperature_in_kelvin().unwrap_or(0);
+
+    let mut is_back_on = None;
+    let mut back_brightness_percentage = None;
+
+    if dt == "beam_lx" {
+        is_back_on = device_handle.is_back_on().ok();
+        back_brightness_percentage = device_handle.back_brightness_percentage().ok();
+    }
+
+    DeviceState {
+        serial_number: sn,
+        device_type: dt.to_string(),
+        is_on,
+        brightness_in_lumen,
+        temperature_in_kelvin,
+        is_back_on,
+        back_brightness_percentage,
+    }
+}
+
 fn turn_on_all_supported_devices_and_log(
     context: &mut Litra,
     serial_number: Option<&str>,
@@ -410,6 +441,7 @@ fn turn_on_all_supported_devices_and_log(
     device_type: Option<&str>,
     require_device: bool,
     back: bool,
+    app_states: &mut std::collections::HashMap<String, bool>,
 ) -> Result<(), CliError> {
     let device_handles = get_all_supported_devices(
         context,
@@ -423,23 +455,35 @@ fn turn_on_all_supported_devices_and_log(
         print_device_not_found_log(serial_number);
     } else {
         for device_handle in device_handles {
-            info!(
-                "Turning on {} device (serial number: {})",
-                device_handle.device_type(),
-                get_serial_number_with_fallback(&device_handle)
-            );
+            let sn = get_serial_number_with_fallback(&device_handle);
+            let current_state = get_current_device_state(&device_handle);
 
-            // Ignore errors for individual devices when targeting multiple
-            if let Err(e) = device_handle.set_on(true) {
-                warn!(
-                    "Failed to turn on {} device (serial number: {}): {}",
+            if current_state.is_on {
+                if app_states.contains_key(&sn) {
+                    info!("Device {} is already on (tracked), nothing to do.", sn);
+                } else {
+                    info!("Device {} is already on (externally), not tracking.", sn);
+                }
+            } else {
+                info!(
+                    "Turning on {} device (serial number: {})",
                     device_handle.device_type(),
-                    get_serial_number_with_fallback(&device_handle),
-                    e
+                    sn
                 );
-            }
 
-            toggle_back_light_if_applicable(&device_handle, true, back);
+                if let Err(e) = device_handle.set_on(true) {
+                    warn!(
+                        "Failed to turn on {} device (serial number: {}): {}",
+                        device_handle.device_type(),
+                        sn,
+                        e
+                    );
+                }
+
+                toggle_back_light_if_applicable(&device_handle, true, back);
+
+                app_states.insert(sn.clone(), true);
+            }
         }
     }
 
@@ -453,6 +497,7 @@ fn turn_off_all_supported_devices_and_log(
     device_type: Option<&str>,
     require_device: bool,
     back: bool,
+    app_states: &mut std::collections::HashMap<String, bool>,
 ) -> Result<(), CliError> {
     let device_handles = get_all_supported_devices(
         context,
@@ -466,23 +511,36 @@ fn turn_off_all_supported_devices_and_log(
         print_device_not_found_log(serial_number);
     } else {
         for device_handle in device_handles {
-            info!(
-                "Turning off {} device (serial number: {})",
-                device_handle.device_type(),
-                get_serial_number_with_fallback(&device_handle)
-            );
+            let sn = get_serial_number_with_fallback(&device_handle);
+            let current_state = get_current_device_state(&device_handle);
 
-            // Ignore errors for individual devices when targeting multiple
-            if let Err(e) = device_handle.set_on(false) {
-                warn!(
-                    "Failed to turn off {} device (serial number: {}): {}",
-                    device_handle.device_type(),
-                    get_serial_number_with_fallback(&device_handle),
-                    e
-                );
+            if !current_state.is_on {
+                info!("Device {} is already off.", sn);
+                app_states.remove(&sn);
+                continue;
             }
 
-            toggle_back_light_if_applicable(&device_handle, false, back);
+            if app_states.contains_key(&sn) {
+                info!(
+                    "Turning off {} device (serial number: {})",
+                    device_handle.device_type(),
+                    sn
+                );
+
+                if let Err(e) = device_handle.set_on(false) {
+                    warn!(
+                        "Failed to turn off {} device (serial number: {}): {}",
+                        device_handle.device_type(),
+                        sn,
+                        e
+                    );
+                }
+
+                toggle_back_light_if_applicable(&device_handle, false, back);
+                app_states.remove(&sn);
+            } else {
+                info!("Device {} was turned on externally, not turning off.", sn);
+            }
         }
     }
 
@@ -535,33 +593,7 @@ fn save_device_states(
             sn
         );
 
-        let dt = match device_handle.device_type() {
-            litra::DeviceType::LitraGlow => "glow",
-            litra::DeviceType::LitraBeam => "beam",
-            litra::DeviceType::LitraBeamLX => "beam_lx",
-        };
-
-        let is_on = device_handle.is_on().unwrap_or(false);
-        let brightness_in_lumen = device_handle.brightness_in_lumen().unwrap_or(0);
-        let temperature_in_kelvin = device_handle.temperature_in_kelvin().unwrap_or(0);
-
-        let mut is_back_on = None;
-        let mut back_brightness_percentage = None;
-
-        if dt == "beam_lx" {
-            is_back_on = device_handle.is_back_on().ok();
-            back_brightness_percentage = device_handle.back_brightness_percentage().ok();
-        }
-
-        states.push(DeviceState {
-            serial_number: sn,
-            device_type: dt.to_string(),
-            is_on,
-            brightness_in_lumen,
-            temperature_in_kelvin,
-            is_back_on,
-            back_brightness_percentage,
-        });
+        states.push(get_current_device_state(&device_handle));
     }
 
     let state_file_path = get_state_file_path()?;
@@ -718,6 +750,8 @@ async fn handle_autotoggle_command(
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
+    let app_states: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let app_states_arc = Arc::new(tokio::sync::Mutex::new(app_states));
 
     if save_state {
         let mut context_lock = context.lock().await;
@@ -812,6 +846,7 @@ async fn handle_autotoggle_command(
             // Clone variables for the async task
             let desired_state_clone = desired_state.clone();
             let context_clone = context.clone();
+            let app_states_clone = app_states_arc.clone();
             let serial_number_clone = serial_number.map(|s| s.to_string());
             let device_path_clone = device_path.map(|s| s.to_string());
             let device_type_clone = device_type.map(|s| s.to_string());
@@ -827,6 +862,7 @@ async fn handle_autotoggle_command(
 
                 if let Some(state) = state {
                     let mut context_lock = context_clone.lock().await;
+                    let mut app_states_lock = app_states_clone.lock().await;
                     if state {
                         info!("Attempting to turn on Litra device(s)...");
                         let _ = turn_on_all_supported_devices_and_log(
@@ -836,6 +872,7 @@ async fn handle_autotoggle_command(
                             device_type_clone.as_deref(),
                             require_device,
                             back,
+                            &mut app_states_lock,
                         );
                     } else {
                         info!("Attempting to turn off Litra device(s)...");
@@ -846,6 +883,7 @@ async fn handle_autotoggle_command(
                             device_type_clone.as_deref(),
                             require_device,
                             back,
+                            &mut app_states_lock,
                         );
                     }
                 }
@@ -875,6 +913,8 @@ async fn handle_autotoggle_command(
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
+    let app_states: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let app_states_arc = Arc::new(tokio::sync::Mutex::new(app_states));
 
     if save_state {
         let mut context_lock = context.lock().await;
@@ -990,6 +1030,7 @@ async fn handle_autotoggle_command(
         // Clone variables for the async task
         let desired_state_clone = desired_state.clone();
         let context_clone = context.clone();
+        let app_states_clone = app_states_arc.clone();
         let serial_number_clone = serial_number.map(|s| s.to_string());
         let device_path_clone = device_path.map(|s| s.to_string());
         let device_type_clone = device_type.map(|s| s.to_string());
@@ -1005,6 +1046,7 @@ async fn handle_autotoggle_command(
 
             if let Some(state) = state {
                 let mut context_lock = context_clone.lock().await;
+                let mut app_states_lock = app_states_clone.lock().await;
                 if state {
                     info!("Attempting to turn on Litra device(s)...");
                     let _ = turn_on_all_supported_devices_and_log(
@@ -1014,6 +1056,7 @@ async fn handle_autotoggle_command(
                         device_type_clone.as_deref(),
                         require_device,
                         back,
+                        &mut app_states_lock,
                     );
                 } else {
                     info!("Attempting to turn off Litra device(s)...");
@@ -1024,6 +1067,7 @@ async fn handle_autotoggle_command(
                         device_type_clone.as_deref(),
                         require_device,
                         back,
+                        &mut app_states_lock,
                     );
                 }
             }
@@ -1053,6 +1097,8 @@ async fn handle_autotoggle_command(
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
+    let app_states: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let app_states_arc = Arc::new(tokio::sync::Mutex::new(app_states));
 
     if save_state {
         let mut context_lock = context.lock().await;
@@ -1181,6 +1227,7 @@ async fn handle_autotoggle_command(
             // Clone variables for the async task
             let desired_state_clone = desired_state.clone();
             let context_clone = context.clone();
+            let app_states_clone = app_states_arc.clone();
             let serial_number_clone = serial_number.map(|s| s.to_string());
             let device_path_clone = device_path.map(|s| s.to_string());
             let device_type_clone = device_type.map(|s| s.to_string());
@@ -1196,6 +1243,7 @@ async fn handle_autotoggle_command(
 
                 if let Some(state) = state {
                     let mut context_lock = context_clone.lock().await;
+                    let mut app_states_lock = app_states_clone.lock().await;
                     if state {
                         info!("Attempting to turn on Litra device(s)...");
                         let _ = turn_on_all_supported_devices_and_log(
@@ -1205,6 +1253,7 @@ async fn handle_autotoggle_command(
                             device_type_clone.as_deref(),
                             require_device,
                             back,
+                            &mut app_states_lock,
                         );
                     } else {
                         info!("Attempting to turn off Litra device(s)...");
@@ -1215,6 +1264,7 @@ async fn handle_autotoggle_command(
                             device_type_clone.as_deref(),
                             require_device,
                             back,
+                            &mut app_states_lock,
                         );
                     }
                 }
